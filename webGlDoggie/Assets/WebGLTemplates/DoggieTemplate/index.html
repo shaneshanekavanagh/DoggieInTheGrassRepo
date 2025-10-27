@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>%UNITY_WEB_NAME%</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <style>
+        :root {
+            color-scheme: dark light;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            background: #0b1d24;
+            font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+            color: #f0f6f8;
+            overflow: hidden;
+        }
+
+        body {
+            display: flex;
+            align-items: stretch;
+        }
+
+        #unity-container {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 100%;
+        }
+
+        canvas {
+            width: 100%;
+            height: 100%;
+            background: #0b1d24;
+        }
+
+        #unity-loading-bar {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: clamp(180px, 40vw, 320px);
+            display: none;
+            gap: 12px;
+            align-items: center;
+            flex-direction: column;
+        }
+
+        #unity-progress-bar-empty {
+            width: 100%;
+            height: 12px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.2);
+            overflow: hidden;
+        }
+
+        #unity-progress-bar-full {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #58d3ff, #1f9dff);
+            border-radius: 6px;
+            transition: width 0.2s ease-out;
+        }
+
+        #fullscreen-controls {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            z-index: 10;
+        }
+
+        .control-button {
+            min-width: 120px;
+            padding: 10px 16px;
+            border-radius: 999px;
+            border: none;
+            background: rgba(16, 40, 52, 0.9);
+            color: #f3fbff;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s ease, transform 0.1s ease;
+        }
+
+        .control-button:hover,
+        .control-button:focus-visible {
+            background: rgba(47, 126, 163, 0.85);
+            outline: none;
+        }
+
+        .control-button:active {
+            transform: scale(0.97);
+        }
+
+        #status-toast {
+            position: absolute;
+            left: 16px;
+            bottom: 16px;
+            padding: 12px 18px;
+            background: rgba(16, 40, 52, 0.85);
+            border-radius: 12px;
+            font-size: 14px;
+            line-height: 1.3;
+            max-width: 320px;
+            pointer-events: none;
+            opacity: 0;
+            transform: translateY(12px);
+            transition: opacity 0.25s ease, transform 0.25s ease;
+            z-index: 10;
+        }
+
+        #status-toast.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        #mobile-hint {
+            position: absolute;
+            left: 16px;
+            top: 16px;
+            padding: 10px 14px;
+            border-radius: 12px;
+            background: rgba(16, 40, 52, 0.85);
+            font-size: 14px;
+            max-width: 320px;
+            display: none;
+            z-index: 10;
+        }
+
+        .unity-mobile #mobile-hint {
+            display: block;
+        }
+
+        @media (max-width: 768px) {
+            #fullscreen-controls {
+                flex-direction: row;
+                left: 50%;
+                top: auto;
+                bottom: 16px;
+                right: auto;
+                transform: translateX(-50%);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="unity-container" class="unity-desktop">
+        <canvas id="unity-canvas"></canvas>
+        <div id="unity-loading-bar">
+            <div id="unity-logo">
+                <img src="%UNITY_WEBGL_LOGO%">
+            </div>
+            <div id="unity-progress-bar-empty">
+                <div id="unity-progress-bar-full"></div>
+            </div>
+        </div>
+        <div id="fullscreen-controls">
+            <button id="enter-fullscreen" class="control-button" type="button">Enter Fullscreen</button>
+            <button id="exit-fullscreen" class="control-button" type="button">Exit Fullscreen</button>
+        </div>
+        <div id="mobile-hint">
+            Tap anywhere to move the doggie. Use the buttons to toggle fullscreen.
+        </div>
+        <div id="status-toast" role="status" aria-live="polite"></div>
+    </div>
+
+    <script>
+        const container = document.querySelector("#unity-container");
+        const canvas = document.querySelector("#unity-canvas");
+        const loadingBar = document.querySelector("#unity-loading-bar");
+        const progressBarFull = document.querySelector("#unity-progress-bar-full");
+        const enterFullscreenBtn = document.querySelector("#enter-fullscreen");
+        const exitFullscreenBtn = document.querySelector("#exit-fullscreen");
+        const statusToast = document.querySelector("#status-toast");
+
+        if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
+            container.classList.add("unity-mobile");
+        } else {
+            container.classList.add("unity-desktop");
+        }
+
+        canvas.style.width = "100%";
+        canvas.style.height = "100%";
+
+        const showToast = (message, duration = 1800) => {
+            if (!statusToast) {
+                return;
+            }
+            statusToast.textContent = message;
+            statusToast.classList.add("visible");
+            if (duration > 0) {
+                setTimeout(() => statusToast.classList.remove("visible"), duration);
+            }
+        };
+
+        function unityShowBanner(msg, type) {
+            const duration = type === "error" ? 0 : 2000;
+            showToast(msg, duration);
+        }
+
+        const config = {
+            dataUrl: "%UNITY_WEBGL_DATA_URL%",
+            frameworkUrl: "%UNITY_WEBGL_FRAMEWORK_URL%",
+            codeUrl: "%UNITY_WEBGL_CODE_URL%",
+            streamingAssetsUrl: "StreamingAssets",
+            companyName: "%UNITY_COMPANY_NAME%",
+            productName: "%UNITY_PRODUCT_NAME%",
+            productVersion: "%UNITY_PRODUCT_VERSION%",
+            showBanner: unityShowBanner,
+            matchWebGLToCanvasSize: %UNITY_ENABLE_CANVAS_RESIZE%,
+            devicePixelRatio: %UNITY_WEBGL_DEVICE_PIXEL_RATIO%
+        };
+
+        const loaderUrl = "%UNITY_WEBGL_LOADER_URL%";
+        loadingBar.style.display = "flex";
+
+        let unityInstance = null;
+        let isFullscreen = !!document.fullscreenElement;
+        let pendingUserToggle = false;
+
+        const toggleFullscreen = (enable) => {
+            if (!unityInstance) {
+                return;
+            }
+
+            if (enable && document.fullscreenEnabled === false) {
+                showToast("Fullscreen is not supported in this browser.", 2600);
+                return;
+            }
+
+            pendingUserToggle = true;
+            const result = unityInstance.SetFullscreen(enable ? 1 : 0);
+
+            if (result && typeof result.then === "function") {
+                result.catch(() => {
+                    pendingUserToggle = false;
+                    showToast("Unable to change fullscreen state.", 2600);
+                });
+            }
+        };
+
+        enterFullscreenBtn.addEventListener("click", () => toggleFullscreen(true));
+        exitFullscreenBtn.addEventListener("click", () => toggleFullscreen(false));
+
+        document.addEventListener("keydown", (event) => {
+            const key = event.key.toLowerCase();
+            if (key === "f") {
+                toggleFullscreen(!isFullscreen);
+            } else if (key === "escape" || key === "esc") {
+                toggleFullscreen(false);
+            }
+        });
+
+        const syncFullscreenState = () => {
+            const currentlyFullscreen = !!document.fullscreenElement;
+            if (currentlyFullscreen === isFullscreen) {
+                if (pendingUserToggle) {
+                    pendingUserToggle = false;
+                }
+                return;
+            }
+
+            isFullscreen = currentlyFullscreen;
+
+            if (pendingUserToggle) {
+                pendingUserToggle = false;
+                showToast(isFullscreen ? "Fullscreen enabled" : "Fullscreen disabled");
+            } else {
+                showToast(isFullscreen ? "Fullscreen enabled" : "Fullscreen disabled");
+            }
+        };
+
+        document.addEventListener("fullscreenchange", syncFullscreenState);
+        document.addEventListener("webkitfullscreenchange", syncFullscreenState);
+
+        const script = document.createElement("script");
+        script.src = loaderUrl;
+        script.onload = () => {
+            createUnityInstance(canvas, config, (progress) => {
+                progressBarFull.style.width = `${100 * progress}%`;
+            }).then((instance) => {
+                unityInstance = instance;
+                loadingBar.style.display = "none";
+                showToast("Loaded");
+            }).catch((message) => {
+                showToast(message, 0);
+            });
+        };
+        document.body.appendChild(script);
+    </script>
+</body>
+</html>
