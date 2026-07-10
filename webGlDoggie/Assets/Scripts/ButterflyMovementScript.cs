@@ -3,6 +3,14 @@ using UnityEngine;
 
 public class ButterflyMovementScript : MonoBehaviour
 {
+    private enum TreeFlightState
+    {
+        Free,
+        Approaching,
+        Landed,
+        Departing
+    }
+
     [Header("Targeting")]
     [SerializeField] private Transform target;
     [SerializeField] private DoggieWalk dog;
@@ -28,16 +36,41 @@ public class ButterflyMovementScript : MonoBehaviour
     [SerializeField] private float additionalFleeDistance = 2f;
     [SerializeField] private float dogArrivalFleeMultiplier = 1.5f;
 
+    [Header("Tree Landing")]
+    [SerializeField] private LowPolyRuntimeTreeGenerator treeGenerator;
+    [Tooltip("Horizontal distance from a canopy edge at which the butterfly begins landing.")]
+    [SerializeField, Min(0f)] private float treeLandingSearchDistance = 0.9f;
+    [Tooltip("How long the butterfly rests on the canopy.")]
+    [SerializeField, Min(0f)] private float treeLandingDuration = 2f;
+    [Tooltip("Distance travelled away from a tree after taking off.")]
+    [SerializeField] private Vector2 treeDepartureDistanceRange = new Vector2(4f, 7f);
+    [Tooltip("Random horizontal angle added to the direction away from the landed tree.")]
+    [SerializeField, Range(0f, 75f)] private float treeDepartureAngleVariation = 35f;
+    [Tooltip("Prevents immediately landing on the same tree after departure.")]
+    [SerializeField, Min(0f)] private float sameTreeRelandingDelay = 4f;
+    [SerializeField, Min(0.01f)] private float treeLandingArrivalDistance = 0.08f;
+
     private Coroutine movementCoroutine;
     private Vector3? overrideTargetPosition;
     private bool dogWithinRange;
+    private TreeFlightState treeFlightState;
+    private Vector3 treeFlightTarget;
+    private float treeLandingTimer;
+    private float sameTreeCooldownTimer;
+    private int activeTreeIndex = -1;
+    private int lastLandedTreeIndex = -1;
 
     private void Reset()
     {
         target = transform;
         if (dog == null)
         {
-            dog = FindObjectOfType<DoggieWalk>();
+            dog = FindFirstObjectByType<DoggieWalk>();
+        }
+
+        if (treeGenerator == null)
+        {
+            treeGenerator = FindFirstObjectByType<LowPolyRuntimeTreeGenerator>();
         }
     }
 
@@ -45,7 +78,12 @@ public class ButterflyMovementScript : MonoBehaviour
     {
         if (dog == null)
         {
-            dog = FindObjectOfType<DoggieWalk>();
+            dog = FindFirstObjectByType<DoggieWalk>();
+        }
+
+        if (treeGenerator == null)
+        {
+            treeGenerator = FindFirstObjectByType<LowPolyRuntimeTreeGenerator>();
         }
     }
 
@@ -53,6 +91,11 @@ public class ButterflyMovementScript : MonoBehaviour
     {
         dogWithinRange = false;
         overrideTargetPosition = null;
+        treeFlightState = TreeFlightState.Free;
+        treeLandingTimer = 0f;
+        sameTreeCooldownTimer = 0f;
+        activeTreeIndex = -1;
+        lastLandedTreeIndex = -1;
 
         if (movementCoroutine != null)
         {
@@ -73,6 +116,7 @@ public class ButterflyMovementScript : MonoBehaviour
 
     public void SetTarget(Transform newTarget)
     {
+        CancelTreeFlight();
         target = newTarget;
         overrideTargetPosition = null;
     }
@@ -93,14 +137,34 @@ public class ButterflyMovementScript : MonoBehaviour
     {
         while (true)
         {
-            UpdateFleeTarget();
+            float deltaTime = Time.deltaTime;
+            if (sameTreeCooldownTimer > 0f)
+            {
+                sameTreeCooldownTimer -= deltaTime;
+            }
 
-            Vector3 desiredPosition = ApplyHeightAndClamp(GetBaseTargetPosition());
+            UpdateFleeTarget();
+            UpdateTreeFlightState(deltaTime);
+
+            if (treeFlightState == TreeFlightState.Landed)
+            {
+                transform.position = treeFlightTarget;
+                yield return null;
+                continue;
+            }
+
+            bool usingTreeTarget = treeFlightState == TreeFlightState.Approaching ||
+                                   treeFlightState == TreeFlightState.Departing;
+            Vector3 desiredPosition = usingTreeTarget
+                ? treeFlightTarget
+                : ApplyHeightAndClamp(GetBaseTargetPosition());
 
             Vector3 currentPosition = transform.position;
             Vector3 movement = desiredPosition - currentPosition;
             float sqrDistance = movement.sqrMagnitude;
-            float arrivalThreshold = GetArrivalThreshold(sqrDistance);
+            float arrivalThreshold = treeFlightState == TreeFlightState.Approaching
+                ? treeLandingArrivalDistance
+                : GetArrivalThreshold(sqrDistance);
             float arrivalThresholdSqr = arrivalThreshold * arrivalThreshold;
 
             if (sqrDistance > 0.0001f)
@@ -111,11 +175,115 @@ public class ButterflyMovementScript : MonoBehaviour
 
             if (sqrDistance > arrivalThresholdSqr)
             {
-                transform.position = Vector3.MoveTowards(currentPosition, desiredPosition, speed * Time.deltaTime);
+                transform.position = Vector3.MoveTowards(currentPosition, desiredPosition, speed * deltaTime);
+            }
+            else if (treeFlightState == TreeFlightState.Approaching)
+            {
+                CompleteTreeLanding();
+            }
+            else if (treeFlightState == TreeFlightState.Departing)
+            {
+                treeFlightState = TreeFlightState.Free;
+                activeTreeIndex = -1;
             }
 
             yield return null;
         }
+    }
+
+    private void UpdateTreeFlightState(float deltaTime)
+    {
+        if (treeGenerator == null)
+        {
+            return;
+        }
+
+        if (treeFlightState == TreeFlightState.Landed)
+        {
+            treeLandingTimer -= deltaTime;
+            if (treeLandingTimer <= 0f)
+            {
+                BeginTreeDeparture();
+            }
+
+            return;
+        }
+
+        if (treeFlightState != TreeFlightState.Free || dogWithinRange)
+        {
+            return;
+        }
+
+        int excludedTree = sameTreeCooldownTimer > 0f ? lastLandedTreeIndex : -1;
+        if (treeGenerator.TryGetCanopyLandingPoint(
+                transform.position,
+                treeLandingSearchDistance,
+                excludedTree,
+                out Vector3 landingPoint,
+                out int treeIndex))
+        {
+            treeFlightTarget = landingPoint;
+            activeTreeIndex = treeIndex;
+            treeFlightState = TreeFlightState.Approaching;
+        }
+    }
+
+    private void CompleteTreeLanding()
+    {
+        transform.position = treeFlightTarget;
+        treeFlightState = TreeFlightState.Landed;
+        treeLandingTimer = treeLandingDuration;
+        lastLandedTreeIndex = activeTreeIndex;
+        PlayArrivalParticles(treeFlightTarget);
+    }
+
+    private void BeginTreeDeparture()
+    {
+        Vector3 departureDirection = Vector3.forward;
+        if (treeGenerator != null &&
+            treeGenerator.TryGetTreeCentre(activeTreeIndex, out Vector3 treeCentre))
+        {
+            departureDirection = transform.position - treeCentre;
+            departureDirection.y = 0f;
+        }
+
+        if (departureDirection.sqrMagnitude <= 0.0001f)
+        {
+            float fallbackAngle = Random.Range(0f, 360f) * Mathf.Deg2Rad;
+            departureDirection = new Vector3(Mathf.Cos(fallbackAngle), 0f, Mathf.Sin(fallbackAngle));
+        }
+
+        departureDirection.Normalize();
+        departureDirection = Quaternion.Euler(
+            0f,
+            Random.Range(-treeDepartureAngleVariation, treeDepartureAngleVariation),
+            0f) * departureDirection;
+
+        float departureDistance = Random.Range(
+            treeDepartureDistanceRange.x,
+            treeDepartureDistanceRange.y);
+        Vector3 departureTarget = transform.position + departureDirection * departureDistance;
+        departureTarget = ClampToBounds(departureTarget);
+        departureTarget.y = lockedHeight;
+
+        treeFlightTarget = departureTarget;
+        overrideTargetPosition = departureTarget;
+        sameTreeCooldownTimer = sameTreeRelandingDelay;
+        treeFlightState = TreeFlightState.Departing;
+    }
+
+    private void CancelTreeFlight()
+    {
+        if (treeFlightState == TreeFlightState.Landed ||
+            treeFlightState == TreeFlightState.Approaching)
+        {
+            lastLandedTreeIndex = activeTreeIndex;
+            sameTreeCooldownTimer = sameTreeRelandingDelay;
+        }
+
+        treeFlightState = TreeFlightState.Free;
+        treeLandingTimer = 0f;
+        activeTreeIndex = -1;
     }
 
     private Vector3 GetBaseTargetPosition()
@@ -166,6 +334,7 @@ public class ButterflyMovementScript : MonoBehaviour
 
     private void TriggerDogArrivalResponse(Transform dogTransform)
     {
+        CancelTreeFlight();
         PlayArrivalParticles(transform.position);
         overrideTargetPosition = ComputeEscapeTarget(dogTransform, true);
     }
@@ -304,5 +473,14 @@ public class ButterflyMovementScript : MonoBehaviour
         closeProximityDistance = Mathf.Max(0f, closeProximityDistance);
         closeProximityArrivalThreshold = Mathf.Max(minimumArrivalThreshold, closeProximityArrivalThreshold);
         dogArrivalFleeMultiplier = Mathf.Max(1f, dogArrivalFleeMultiplier);
+        treeLandingSearchDistance = Mathf.Max(0f, treeLandingSearchDistance);
+        treeLandingDuration = Mathf.Max(0f, treeLandingDuration);
+        treeDepartureDistanceRange.x = Mathf.Max(0.1f, treeDepartureDistanceRange.x);
+        treeDepartureDistanceRange.y = Mathf.Max(
+            treeDepartureDistanceRange.x,
+            treeDepartureDistanceRange.y);
+        treeDepartureAngleVariation = Mathf.Clamp(treeDepartureAngleVariation, 0f, 75f);
+        sameTreeRelandingDelay = Mathf.Max(0f, sameTreeRelandingDelay);
+        treeLandingArrivalDistance = Mathf.Max(0.01f, treeLandingArrivalDistance);
     }
 }

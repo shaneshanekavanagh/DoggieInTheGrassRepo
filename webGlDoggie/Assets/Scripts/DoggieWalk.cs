@@ -21,6 +21,13 @@ public class DoggieWalk : MonoBehaviour
     [SerializeField] private Vector2 randomXBounds = new Vector2(-16f, 16f);
     [SerializeField] private Vector2 randomZBounds = new Vector2(-7f, 20f);
 
+    [Header("Tree Avoidance")]
+    [SerializeField] private LowPolyRuntimeTreeGenerator treeGenerator;
+    [Tooltip("Extra horizontal space kept between the dog's pivot and each trunk.")]
+    [SerializeField, Min(0f)] private float trunkClearance = 0.55f;
+    [Tooltip("How far ahead the steering checks for a trunk blocking the current route.")]
+    [SerializeField, Min(0.1f)] private float trunkAvoidanceLookAhead = 1.5f;
+
     private Transform currentTarget;
     private Animator cachedAnimator;
     private Coroutine arrivalRoutine;
@@ -49,7 +56,12 @@ public class DoggieWalk : MonoBehaviour
 
         if (butterfly == null)
         {
-            butterfly = FindObjectOfType<ButterflyMovementScript>();
+            butterfly = FindFirstObjectByType<ButterflyMovementScript>();
+        }
+
+        if (treeGenerator == null)
+        {
+            treeGenerator = FindFirstObjectByType<LowPolyRuntimeTreeGenerator>();
         }
     }
 
@@ -120,6 +132,8 @@ public class DoggieWalk : MonoBehaviour
         stoppingDistance = Mathf.Max(0.01f, stoppingDistance);
         arrivalBarkDuration = Mathf.Max(0f, arrivalBarkDuration);
         locationLockThreshold = Mathf.Max(0.01f, locationLockThreshold);
+        trunkClearance = Mathf.Max(0f, trunkClearance);
+        trunkAvoidanceLookAhead = Mathf.Max(0.1f, trunkAvoidanceLookAhead);
 
         if (randomXBounds.y < randomXBounds.x)
         {
@@ -162,6 +176,13 @@ public class DoggieWalk : MonoBehaviour
         ExitRaiseHeadState();
 
         manualTargetPosition = new Vector3(worldPosition.x, transform.position.y, worldPosition.z);
+        if (treeGenerator != null)
+        {
+            manualTargetPosition = treeGenerator.ConstrainMovementAgainstTrunks(
+                transform.position,
+                manualTargetPosition,
+                trunkClearance);
+        }
         hasManualTarget = true;
         currentTarget = null;
         usingIdleSpeed = idleMove;
@@ -221,7 +242,8 @@ public class DoggieWalk : MonoBehaviour
 
         targetPosition.y = transform.position.y;
 
-        Vector3 direction = targetPosition - transform.position;
+        Vector3 currentPosition = transform.position;
+        Vector3 direction = targetPosition - currentPosition;
         float arrivalThreshold = Mathf.Max(stoppingDistance, locationLockThreshold);
         float sqrArrivalThreshold = arrivalThreshold * arrivalThreshold;
 
@@ -234,13 +256,35 @@ public class DoggieWalk : MonoBehaviour
         float moveSpeed = usingIdleSpeed ? walkSpeed : runSpeed;
         float rotationSpeed = usingIdleSpeed ? walkRotationSpeed : runRotationSpeed;
 
-        if (direction.sqrMagnitude > float.Epsilon)
+        Vector3 movementDirection = direction.normalized;
+        if (treeGenerator != null)
         {
-            Quaternion targetRotation = Quaternion.LookRotation(direction);
+            movementDirection = treeGenerator.GetTrunkAvoidanceDirection(
+                currentPosition,
+                movementDirection,
+                trunkClearance,
+                trunkAvoidanceLookAhead);
+        }
+
+        if (movementDirection.sqrMagnitude > float.Epsilon)
+        {
+            Quaternion targetRotation = Quaternion.LookRotation(movementDirection);
             transform.rotation = Quaternion.RotateTowards(transform.rotation, targetRotation, rotationSpeed * Time.deltaTime);
         }
 
-        transform.position = Vector3.MoveTowards(transform.position, targetPosition, moveSpeed * Time.deltaTime);
+        float movementStep = Mathf.Min(moveSpeed * Time.deltaTime, direction.magnitude);
+        Vector3 proposedPosition = currentPosition + movementDirection * movementStep;
+        proposedPosition.y = currentPosition.y;
+
+        if (treeGenerator != null)
+        {
+            proposedPosition = treeGenerator.ConstrainMovementAgainstTrunks(
+                currentPosition,
+                proposedPosition,
+                trunkClearance);
+        }
+
+        transform.position = proposedPosition;
 
         if ((transform.position - targetPosition).sqrMagnitude <= sqrArrivalThreshold)
         {

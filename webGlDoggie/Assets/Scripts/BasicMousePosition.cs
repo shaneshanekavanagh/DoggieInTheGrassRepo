@@ -20,6 +20,17 @@ public class BasicMousePosition : MonoBehaviour
     [SerializeField] private ParticleSystem redBallArrivalParticles;
     [SerializeField] private float redBallArrivalParticleYOffset = 1f;
 
+    [Header("Red Ball Tree Interaction")]
+    [SerializeField] private LowPolyRuntimeTreeGenerator treeGenerator;
+    [Tooltip("Approximate radius used for vector-based tree collision tests.")]
+    [SerializeField, Min(0.01f)] private float redBallRadius = 0.35f;
+    [Tooltip("Velocity retained after reflecting from a trunk or canopy.")]
+    [SerializeField, Range(0f, 1.25f)] private float redBallTreeBounciness = 0.8f;
+    [Tooltip("How quickly a bounced ball curves back toward its selected destination.")]
+    [SerializeField, Min(0f)] private float redBallBounceRecovery = 7f;
+    [Tooltip("Safety cap preventing a ball from becoming trapped between overlapping canopies.")]
+    [SerializeField, Range(1, 12)] private int maximumTreeBouncesPerThrow = 6;
+
     [Header("Random Roaming")]
     [SerializeField] private bool randomRoamEnabled = true;
     [SerializeField] private Vector2 randomXBounds = new Vector2(-16f, 16f);
@@ -34,13 +45,14 @@ public class BasicMousePosition : MonoBehaviour
     private Vector3 redBallOriginalPosition = new Vector3(12f, 1f, -8f);
     private Vector3 redBallTargetPosition;
     private Vector3 redBallTargetGroundPosition;
-    private bool redBallEngaged;
     private bool redBallAwaitingSecondTouch;
     private bool redBallMoving;
     private bool redBallAwaitingDogArrival;
     private bool redBallChaseActive;
     private float redBallChaseDelayTimer;
     private bool redBallDogFollowingTransform;
+    private Vector3 redBallVelocity;
+    private int redBallTreeBounceCount;
 
     private void Awake()
     {
@@ -48,7 +60,12 @@ public class BasicMousePosition : MonoBehaviour
 
         if (doggie == null)
         {
-            doggie = FindObjectOfType<DoggieWalk>();
+            doggie = FindFirstObjectByType<DoggieWalk>();
+        }
+
+        if (treeGenerator == null)
+        {
+            treeGenerator = FindFirstObjectByType<LowPolyRuntimeTreeGenerator>();
         }
 
         if (doggie == null)
@@ -102,6 +119,7 @@ public class BasicMousePosition : MonoBehaviour
     private void Update()
     {
         UpdateRedBallMovement();
+        UpdateRedBallChase();
 
         if (!TryGetInteractionPoint(out var hitPoint))
         {
@@ -109,7 +127,6 @@ public class BasicMousePosition : MonoBehaviour
         }
 
         HandlePointerInteraction(hitPoint);
-        UpdateRedBallChase();
     }
 
     private void HandlePointerInteraction(Vector3 hitPoint)
@@ -314,13 +331,14 @@ public class BasicMousePosition : MonoBehaviour
             return;
         }
 
-        redBallEngaged = true;
         redBallAwaitingSecondTouch = true;
         redBallMoving = false;
         redBallAwaitingDogArrival = false;
         redBallChaseActive = false;
         redBallChaseDelayTimer = 0f;
         redBallDogFollowingTransform = false;
+        redBallVelocity = Vector3.zero;
+        redBallTreeBounceCount = 0;
 
         Vector3 hoverPosition = new Vector3(0f, 22f, -18f);
         redBall.position = hoverPosition;
@@ -340,7 +358,6 @@ public class BasicMousePosition : MonoBehaviour
     private void HandleRedBallSecondTouch(Vector3 hitPoint)
     {
         redBallAwaitingSecondTouch = false;
-        redBallEngaged = true;
 
         redBallTargetGroundPosition = new Vector3(hitPoint.x, targetY, hitPoint.z);
         redBallTargetPosition = new Vector3(hitPoint.x, redBallOriginalPosition.y, hitPoint.z);
@@ -374,6 +391,11 @@ public class BasicMousePosition : MonoBehaviour
         redBallChaseActive = redBallChaseDelay <= 0f;
         redBallChaseDelayTimer = Mathf.Max(0f, redBallChaseDelay);
         redBallDogFollowingTransform = false;
+        Vector3 initialDirection = redBallTargetPosition - redBall.position;
+        redBallVelocity = initialDirection.sqrMagnitude > 0.0001f
+            ? initialDirection.normalized * redBallMoveSpeed
+            : Vector3.zero;
+        redBallTreeBounceCount = 0;
 
         if (doggie != null)
         {
@@ -435,10 +457,51 @@ public class BasicMousePosition : MonoBehaviour
         }
 
         Vector3 currentPosition = redBall.position;
-        Vector3 nextPosition = Vector3.MoveTowards(currentPosition, redBallTargetPosition, redBallMoveSpeed * Time.deltaTime);
+        Vector3 toTarget = redBallTargetPosition - currentPosition;
+        float distanceToTarget = toTarget.magnitude;
+        if (distanceToTarget <= 0.0001f)
+        {
+            redBall.position = redBallTargetPosition;
+            OnRedBallMovementComplete();
+            return;
+        }
+
+        Vector3 desiredVelocity = toTarget / distanceToTarget * redBallMoveSpeed;
+        if (redBallVelocity.sqrMagnitude <= 0.0001f)
+        {
+            redBallVelocity = desiredVelocity;
+        }
+        else
+        {
+            redBallVelocity = Vector3.MoveTowards(
+                redBallVelocity,
+                desiredVelocity,
+                redBallBounceRecovery * Time.deltaTime);
+        }
+
+        Vector3 nextPosition = currentPosition + redBallVelocity * Time.deltaTime;
+        bool hitTree = false;
+        if (treeGenerator != null && redBallTreeBounceCount < maximumTreeBouncesPerThrow &&
+            treeGenerator.TryResolveTreeCollision(
+                currentPosition,
+                nextPosition,
+                redBallRadius,
+                out Vector3 resolvedPosition,
+                out Vector3 hitNormal,
+                out _))
+        {
+            nextPosition = resolvedPosition;
+            redBallVelocity = Vector3.Reflect(redBallVelocity, hitNormal) * redBallTreeBounciness;
+            redBallTreeBounceCount++;
+            hitTree = true;
+        }
+
         redBall.position = nextPosition;
 
-        if ((nextPosition - redBallTargetPosition).sqrMagnitude <= 0.0001f)
+        float arrivalDistance = Mathf.Max(0.05f, redBallMoveSpeed * Time.deltaTime);
+        bool crossedTarget = !hitTree &&
+            Vector3.Dot(redBallTargetPosition - currentPosition, redBallTargetPosition - nextPosition) <= 0f;
+        if ((nextPosition - redBallTargetPosition).sqrMagnitude <= arrivalDistance * arrivalDistance || crossedTarget)
         {
             redBall.position = redBallTargetPosition;
             OnRedBallMovementComplete();
@@ -453,6 +516,7 @@ public class BasicMousePosition : MonoBehaviour
     private void OnRedBallMovementComplete()
     {
         redBallMoving = false;
+        redBallVelocity = Vector3.zero;
         redBallChaseActive = false;
         redBallChaseDelayTimer = 0f;
         BeginDogRunToRedBallTarget();
@@ -473,13 +537,14 @@ public class BasicMousePosition : MonoBehaviour
 
     private void ResetRedBallState(bool repositionBall)
     {
-        redBallEngaged = false;
         redBallAwaitingSecondTouch = false;
         redBallMoving = false;
         redBallAwaitingDogArrival = false;
         redBallChaseActive = false;
         redBallChaseDelayTimer = 0f;
         redBallDogFollowingTransform = false;
+        redBallVelocity = Vector3.zero;
+        redBallTreeBounceCount = 0;
 
         redBallTargetPosition = redBallOriginalPosition;
         redBallTargetGroundPosition = new Vector3(redBallOriginalPosition.x, targetY, redBallOriginalPosition.z);
@@ -574,6 +639,10 @@ public class BasicMousePosition : MonoBehaviour
         redBallMoveSpeed = Mathf.Max(0f, redBallMoveSpeed);
         redBallChaseDelay = Mathf.Max(0f, redBallChaseDelay);
         redBallArrivalParticleYOffset = Mathf.Max(0f, redBallArrivalParticleYOffset);
+        redBallRadius = Mathf.Max(0.01f, redBallRadius);
+        redBallTreeBounciness = Mathf.Clamp(redBallTreeBounciness, 0f, 1.25f);
+        redBallBounceRecovery = Mathf.Max(0f, redBallBounceRecovery);
+        maximumTreeBouncesPerThrow = Mathf.Clamp(maximumTreeBouncesPerThrow, 1, 12);
     }
 
 #if UNITY_EDITOR
